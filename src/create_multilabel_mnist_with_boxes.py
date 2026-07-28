@@ -1,8 +1,9 @@
 """Create composite MNIST data for multi-label classification and detection.
 
 Each 64×64 image contains 6, 7, or 8 MNIST digits. The number of examples for
-each count is balanced (it differs by at most one sample), and every digit has
-a ground-truth axis-aligned bounding box and class label.
+each count is balanced (it differs by at most one sample). One rotated digit is
+kept at the image centre and rendered on top; every digit has a ground-truth
+axis-aligned bounding box and class label.
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ except ImportError:  # Keep generation usable when tqdm is not installed.
 IMAGE_SIZE = 64
 DIGIT_SIZE = 28
 MAX_DIGITS = 8
+CENTER_POSITION = ((IMAGE_SIZE - DIGIT_SIZE) // 2, (IMAGE_SIZE - DIGIT_SIZE) // 2)
 BOX_FORMAT = "xyxy_exclusive"  # (x_min, y_min, x_max, y_max)
 
 
@@ -65,8 +67,10 @@ def make_digit_patch(
     min_rotation_degrees: float,
     max_rotation_degrees: float,
     foreground_threshold: float,
-) -> tuple[torch.Tensor, torch.Tensor, float]:
-    """Return a rotated uint8 patch, its foreground mask, and rotation angle."""
+    min_intensity_scale: float,
+    max_intensity_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, float, float]:
+    """Return a rotated/intensity-jittered patch, mask, angle, and scale."""
     image = source_images[index].unsqueeze(0).float() / 255.0
     angle = float(torch.empty(1).uniform_(min_rotation_degrees, max_rotation_degrees).item())
     rotated = TF.rotate(
@@ -76,9 +80,40 @@ def make_digit_patch(
         fill=0.0,
     ).squeeze(0).clamp(0, 1)
     mask = rotated >= foreground_threshold
-    patch = (rotated * 255).round().to(torch.uint8)
+    intensity_scale = float(
+        torch.empty(1).uniform_(min_intensity_scale, max_intensity_scale).item()
+    )
+    patch = (rotated * intensity_scale * 255).clamp(0, 255).round().to(torch.uint8)
     patch[~mask] = 0
-    return patch, mask, angle
+    return patch, mask, angle, intensity_scale
+
+
+def apply_salt_pepper_noise(
+    image: torch.Tensor,
+    probability: float,
+    salt_ratio: float,
+    min_pepper_intensity: float,
+    max_pepper_intensity: float,
+    min_salt_intensity: float,
+    max_salt_intensity: float,
+) -> None:
+    """Apply variable-intensity salt and pepper noise to an entire image."""
+    selected = torch.rand(image.shape) < probability
+    salt = selected & (torch.rand(image.shape) < salt_ratio)
+    pepper = selected & ~salt
+
+    if salt.any():
+        salt_values = torch.empty(int(salt.sum().item())).uniform_(
+            min_salt_intensity,
+            max_salt_intensity,
+        )
+        image[salt] = (salt_values * 255).round().to(torch.uint8)
+    if pepper.any():
+        pepper_values = torch.empty(int(pepper.sum().item())).uniform_(
+            min_pepper_intensity,
+            max_pepper_intensity,
+        )
+        image[pepper] = (pepper_values * 255).round().to(torch.uint8)
 
 
 def random_position() -> tuple[int, int]:
@@ -158,6 +193,15 @@ def compose_split(
     min_rotation_degrees: float,
     max_rotation_degrees: float,
     foreground_threshold: float,
+    min_digit_intensity_scale: float,
+    max_digit_intensity_scale: float,
+    min_salt_pepper_probability: float,
+    max_salt_pepper_probability: float,
+    salt_ratio: float,
+    min_pepper_intensity: float,
+    max_pepper_intensity: float,
+    min_salt_intensity: float,
+    max_salt_intensity: float,
     split_name: str,
 ) -> dict[str, object]:
     """Generate one split while retaining labels, positions, and boxes per digit."""
@@ -171,6 +215,8 @@ def compose_split(
     all_bboxes = torch.full((num_samples, MAX_DIGITS, 4), -1, dtype=torch.int64)
     bbox_labels = torch.full((num_samples, MAX_DIGITS), -1, dtype=torch.int64)
     all_rotation_degrees = torch.full((num_samples, MAX_DIGITS), float("nan"), dtype=torch.float32)
+    all_intensity_scales = torch.full((num_samples, MAX_DIGITS), float("nan"), dtype=torch.float32)
+    salt_pepper_probabilities = torch.empty(num_samples, dtype=torch.float32)
 
     progress = tqdm(
         enumerate(num_digits.tolist()),
@@ -181,23 +227,30 @@ def compose_split(
     )
     for sample_index, digit_count in progress:
         placed_digits: list[tuple[torch.Tensor, tuple[int, int]]] = []
+        pending_draws: list[tuple[torch.Tensor, torch.Tensor, tuple[int, int]]] = []
 
         for slot in range(digit_count):
             for _ in range(digit_attempts):
                 source_index = int(torch.randint(len(source_images), ()).item())
                 digit_label = int(source_labels[source_index].item())
-                patch, mask, angle = make_digit_patch(
+                patch, mask, angle, intensity_scale = make_digit_patch(
                     source_images,
                     source_index,
                     min_rotation_degrees,
                     max_rotation_degrees,
                     foreground_threshold,
+                    min_digit_intensity_scale,
+                    max_digit_intensity_scale,
                 )
-                position = low_overlap_position(
-                    mask,
-                    placed_digits,
-                    max_overlap_ratio=max_overlap_ratio,
-                    attempts=placement_attempts,
+                position = (
+                    CENTER_POSITION
+                    if slot == 0
+                    else low_overlap_position(
+                        mask,
+                        placed_digits,
+                        max_overlap_ratio=max_overlap_ratio,
+                        attempts=placement_attempts,
+                    )
                 )
                 if position is not None:
                     break
@@ -210,20 +263,39 @@ def compose_split(
                 )
 
             row, column = position
-            target = images[sample_index, row : row + DIGIT_SIZE, column : column + DIGIT_SIZE]
-            # Only foreground pixels are drawn; later digits overwrite earlier
-            # digit pixels wherever their foreground masks intersect.
-            target[mask] = patch[mask]
-
             all_digit_labels[sample_index, slot] = digit_label
             bbox_labels[sample_index, slot] = digit_label
             all_positions[sample_index, slot] = torch.tensor((row, column))
             all_bboxes[sample_index, slot] = torch.tensor(tight_bbox(mask, position))
             all_rotation_degrees[sample_index, slot] = angle
+            all_intensity_scales[sample_index, slot] = intensity_scale
             placed_digits.append((mask, position))
+            pending_draws.append((patch, mask, position))
             labels[sample_index, digit_label] = 1.0
             count_labels[sample_index, digit_label] += 1
 
+        # Draw the centred digit (slot 0) last so it remains visible wherever
+        # it overlaps the randomly placed distractor digits.
+        for patch, mask, (row, column) in pending_draws[1:] + pending_draws[:1]:
+            target = images[sample_index, row : row + DIGIT_SIZE, column : column + DIGIT_SIZE]
+            target[mask] = patch[mask]
+
+        noise_probability = float(
+            torch.empty(1).uniform_(
+                min_salt_pepper_probability,
+                max_salt_pepper_probability,
+            ).item()
+        )
+        apply_salt_pepper_noise(
+            images[sample_index],
+            probability=noise_probability,
+            salt_ratio=salt_ratio,
+            min_pepper_intensity=min_pepper_intensity,
+            max_pepper_intensity=max_pepper_intensity,
+            min_salt_intensity=min_salt_intensity,
+            max_salt_intensity=max_salt_intensity,
+        )
+        salt_pepper_probabilities[sample_index] = noise_probability
         center_labels[sample_index] = all_digit_labels[sample_index, 0]
 
     return {
@@ -237,9 +309,11 @@ def compose_split(
         "all_bboxes": all_bboxes,
         "bbox_labels": bbox_labels,
         "all_rotation_degrees": all_rotation_degrees,
+        "all_intensity_scales": all_intensity_scales,
+        "salt_pepper_probabilities": salt_pepper_probabilities,
         "image_size": IMAGE_SIZE,
         "digit_size": DIGIT_SIZE,
-        "center_position": None,
+        "center_position": CENTER_POSITION,
         "num_classes": 10,
         "min_digits": 6,
         "max_digits": 8,
@@ -248,9 +322,23 @@ def compose_split(
         "placement_attempts": placement_attempts,
         "digit_attempts": digit_attempts,
         "foreground_threshold": foreground_threshold,
+        "digit_intensity_scale_range": (
+            min_digit_intensity_scale,
+            max_digit_intensity_scale,
+        ),
+        "salt_pepper_probability_range": (
+            min_salt_pepper_probability,
+            max_salt_pepper_probability,
+        ),
+        "salt_ratio": salt_ratio,
+        "pepper_intensity_range": (
+            min_pepper_intensity,
+            max_pepper_intensity,
+        ),
+        "salt_intensity_range": (min_salt_intensity, max_salt_intensity),
         "use_random_rotation": True,
         "rotation_degrees": (min_rotation_degrees, max_rotation_degrees),
-        "compositing": "later_foreground_pixels_overwrite_earlier_pixels",
+        "compositing": "center_digit_foreground_overwrites_all_other_digits",
         "label_type": "multi_hot_digit_presence",
         "bbox_format": BOX_FORMAT,
         "bbox_label_key": "bbox_labels",
@@ -269,7 +357,7 @@ def write_train_summary(output_dir: Path, train_size: int) -> None:
 | --- | --- | --- |
 | `images` | `uint8`, `({train_size}, 64, 64)` | Grayscale composite images. |
 | `labels` | `float32`, `({train_size}, 10)` | Multi-hot digit-presence target for classes 0–9. |
-| `center_labels` | `int64`, `({train_size},)` | Legacy compatibility key containing the label in slot 0. |
+| `center_labels` | `int64`, `({train_size},)` | Label of slot 0, the centred digit. |
 | `count_labels` | `int64`, `({train_size}, 10)` | Number of appearances of each class. |
 | `num_digits` | `int64`, `({train_size},)` | Number of digit instances: 6, 7, or 8. |
 | `all_digit_labels` | `int64`, `({train_size}, 8)` | Class label for each instance slot. |
@@ -277,8 +365,10 @@ def write_train_summary(output_dir: Path, train_size: int) -> None:
 | `all_bboxes` | `int64`, `({train_size}, 8, 4)` | Tight foreground boxes `(x_min, y_min, x_max, y_max)` after rotation, with exclusive maxima. |
 | `bbox_labels` | `int64`, `({train_size}, 8)` | Class label paired with the box at the same slot in `all_bboxes`. |
 | `all_rotation_degrees` | `float32`, `({train_size}, 8)` | Random rotation angle used for each digit. |
+| `all_intensity_scales` | `float32`, `({train_size}, 8)` | Random bold/dim scale applied to each digit. |
+| `salt_pepper_probabilities` | `float32`, `({train_size},)` | Salt-and-pepper probability sampled for each full image. |
 
-Slots from `num_digits` through slot 7 are padding and use `-1` in the label, position, and box tensors and `NaN` in `all_rotation_degrees`. Every digit is randomly placed. Pairwise overlap is measured using actual rotated foreground masks as `intersection / smaller foreground area`. Later digit foreground pixels overwrite earlier digit pixels.
+Slots from `num_digits` through slot 7 are padding and use `-1` in the label, position, and box tensors and `NaN` in the rotation/intensity tensors. Slot 0 is randomly rotated but fixed at the image centre; all other digits are randomly placed. Pairwise overlap is measured using actual rotated foreground masks as `intersection / smaller foreground area`. The centred digit's foreground is drawn last, so it overwrites every distractor pixel where they overlap. Finally, variable-intensity salt-and-pepper noise is added across the entire image.
 """
     (output_dir / "train_structure.md").write_text(summary, encoding="utf-8")
 
@@ -327,6 +417,60 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         help="Normalized pixel threshold defining digit foreground (default: 0.05).",
     )
+    parser.add_argument(
+        "--min-digit-intensity-scale",
+        type=float,
+        default=0.50,
+        help="Minimum per-digit bold/dim multiplier (default: 0.50).",
+    )
+    parser.add_argument(
+        "--max-digit-intensity-scale",
+        type=float,
+        default=1.50,
+        help="Maximum per-digit bold/dim multiplier (default: 1.50).",
+    )
+    parser.add_argument(
+        "--min-salt-pepper-probability",
+        type=float,
+        default=0.00,
+        help="Minimum per-image noisy-pixel probability (default: 0.0).",
+    )
+    parser.add_argument(
+        "--max-salt-pepper-probability",
+        type=float,
+        default=0.1,
+        help="Maximum per-image noisy-pixel probability (default: 0.02).",
+    )
+    parser.add_argument(
+        "--salt-ratio",
+        type=float,
+        default=0.50,
+        help="Fraction of selected noise pixels assigned to salt (default: 0.50).",
+    )
+    parser.add_argument(
+        "--min-pepper-intensity",
+        type=float,
+        default=0.0,
+        help="Minimum normalized pepper-pixel intensity (default: 0.0).",
+    )
+    parser.add_argument(
+        "--max-pepper-intensity",
+        type=float,
+        default=0.25,
+        help="Maximum normalized pepper-pixel intensity (default: 0.25).",
+    )
+    parser.add_argument(
+        "--min-salt-intensity",
+        type=float,
+        default=0.45,
+        help="Minimum normalized salt-pixel intensity (default: 0.45).",
+    )
+    parser.add_argument(
+        "--max-salt-intensity",
+        type=float,
+        default=1.0,
+        help="Maximum normalized salt-pixel intensity (default: 1.0).",
+    )
     return parser.parse_args()
 
 
@@ -346,6 +490,41 @@ def main() -> None:
         raise ValueError("--foreground-threshold must be between 0 and 1.")
     if args.min_rotation_degrees > args.max_rotation_degrees:
         raise ValueError("--min-rotation-degrees cannot exceed --max-rotation-degrees.")
+    ranges = {
+        "digit intensity scale": (
+            args.min_digit_intensity_scale,
+            args.max_digit_intensity_scale,
+        ),
+        "salt-and-pepper probability": (
+            args.min_salt_pepper_probability,
+            args.max_salt_pepper_probability,
+        ),
+        "pepper intensity": (
+            args.min_pepper_intensity,
+            args.max_pepper_intensity,
+        ),
+        "salt intensity": (
+            args.min_salt_intensity,
+            args.max_salt_intensity,
+        ),
+    }
+    for name, (minimum, maximum) in ranges.items():
+        if minimum > maximum:
+            raise ValueError(f"Minimum {name} cannot exceed maximum {name}.")
+    if args.min_digit_intensity_scale < 0:
+        raise ValueError("Digit intensity scales must be non-negative.")
+    for name in (
+        "min_salt_pepper_probability",
+        "max_salt_pepper_probability",
+        "salt_ratio",
+        "min_pepper_intensity",
+        "max_pepper_intensity",
+        "min_salt_intensity",
+        "max_salt_intensity",
+    ):
+        value = getattr(args, name)
+        if not 0 <= value <= 1:
+            raise ValueError(f"--{name.replace('_', '-')} must be between 0 and 1.")
 
     torch.manual_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -371,6 +550,15 @@ def main() -> None:
             min_rotation_degrees=args.min_rotation_degrees,
             max_rotation_degrees=args.max_rotation_degrees,
             foreground_threshold=args.foreground_threshold,
+            min_digit_intensity_scale=args.min_digit_intensity_scale,
+            max_digit_intensity_scale=args.max_digit_intensity_scale,
+            min_salt_pepper_probability=args.min_salt_pepper_probability,
+            max_salt_pepper_probability=args.max_salt_pepper_probability,
+            salt_ratio=args.salt_ratio,
+            min_pepper_intensity=args.min_pepper_intensity,
+            max_pepper_intensity=args.max_pepper_intensity,
+            min_salt_intensity=args.min_salt_intensity,
+            max_salt_intensity=args.max_salt_intensity,
             split_name=split,
         )
         torch.save(dataset, args.output_dir / f"{split}.pt")

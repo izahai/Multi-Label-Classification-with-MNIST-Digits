@@ -10,3 +10,4 @@ data/MNIST/
 # Notebook and macOS temporary files
 .ipynb_checkpoints/
 .DS_Store
+ap.md
