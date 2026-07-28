@@ -377,9 +377,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mnist-dir", type=Path, default=Path("data"))
     parser.add_argument("--output-dir", type=Path, default=Path("data/uni_with_bboxes"))
-    parser.add_argument("--train-size", type=int, default=200_000)
-    parser.add_argument("--val-size", type=int, default=1)
-    parser.add_argument("--test-size", type=int, default=1)
+    parser.add_argument(
+        "--mode",
+        choices=("all", "train"),
+        default="all",
+        help=(
+            "Splits to generate: 'all' creates train/val/test; "
+            "'train' creates only train.pt (default: all)."
+        ),
+    )
+    parser.add_argument("--train-size", type=int, default=50_000)
+    parser.add_argument("--val-size", type=int, default=0)
+    parser.add_argument("--test-size", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--max-overlap-ratio",
@@ -476,14 +485,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if min(
-        args.train_size,
-        args.val_size,
-        args.test_size,
-        args.placement_attempts,
-        args.digit_attempts,
-    ) < 1:
-        raise ValueError("Split sizes and attempt counts must be positive.")
+    if min(args.train_size, args.placement_attempts, args.digit_attempts) < 1:
+        raise ValueError("Train size and attempt counts must be positive.")
+    if args.mode == "all" and min(args.val_size, args.test_size) < 1:
+        raise ValueError("Validation and test sizes must be positive in --mode all.")
     if not 0 <= args.max_overlap_ratio <= 1:
         raise ValueError("--max-overlap-ratio must be between 0 and 1.")
     if not 0 <= args.foreground_threshold <= 1:
@@ -530,15 +535,20 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     mnist_train = MNIST(args.mnist_dir, train=True, download=True)
-    mnist_test = MNIST(args.mnist_dir, train=False, download=True)
     train_images, val_images = mnist_train.data[:50_000], mnist_train.data[50_000:]
     train_labels, val_labels = mnist_train.targets[:50_000], mnist_train.targets[50_000:]
 
-    for split, source_images, source_labels, size in (
-        ("train", train_images, train_labels, args.train_size),
-        ("val", val_images, val_labels, args.val_size),
-        ("test", mnist_test.data, mnist_test.targets, args.test_size),
-    ):
+    splits = [("train", train_images, train_labels, args.train_size)]
+    if args.mode == "all":
+        mnist_test = MNIST(args.mnist_dir, train=False, download=True)
+        splits.extend(
+            [
+                ("val", val_images, val_labels, args.val_size),
+                ("test", mnist_test.data, mnist_test.targets, args.test_size),
+            ]
+        )
+
+    for split, source_images, source_labels, size in splits:
         print(f"Creating {split}.pt ({size:,} samples)...")
         dataset = compose_split(
             source_images,
@@ -563,8 +573,11 @@ def main() -> None:
         )
         torch.save(dataset, args.output_dir / f"{split}.pt")
 
-    write_train_summary(args.output_dir, args.train_size)
-    print(f"Saved dataset and schema to: {args.output_dir.resolve()}")
+    if args.mode == "all":
+        write_train_summary(args.output_dir, args.train_size)
+        print(f"Saved dataset and schema to: {args.output_dir.resolve()}")
+    else:
+        print(f"Saved train.pt to: {args.output_dir.resolve()}")
 
 
 if __name__ == "__main__":
