@@ -5,6 +5,7 @@ __pycache__/
 
 # Generated datasets
 *.pt
+data/MNIST/
 
 # Notebook and macOS temporary files
 .ipynb_checkpoints/
