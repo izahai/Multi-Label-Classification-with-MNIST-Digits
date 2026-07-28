@@ -19,6 +19,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from .criterion import HungarianDetectionCriterion
 from .dataset import CompositeMNISTDetection, detection_collate
@@ -32,6 +33,7 @@ from .model_factory import (
     checkpoint_model_name,
     default_output_dir,
 )
+from .yolo_criterion import YOLODetectionCriterion
 
 
 LOSS_NAMES = (
@@ -100,7 +102,14 @@ def train_one_epoch(
     model.train()
     totals = {name: 0.0 for name in LOSS_NAMES}
     sample_count = 0
-    for batch_index, (images, targets) in enumerate(loader, start=1):
+    progress = tqdm(
+        loader,
+        desc="Train",
+        unit="batch",
+        dynamic_ncols=True,
+        leave=True,
+    )
+    for batch_index, (images, targets) in enumerate(progress, start=1):
         images = images.to(device, non_blocking=True)
         targets = move_targets(targets, device)
         optimizer.zero_grad(set_to_none=True)
@@ -121,13 +130,10 @@ def train_one_epoch(
             totals[name] += float(losses[name].detach().item()) * batch_size
 
         if batch_index % log_interval == 0 or batch_index == len(loader):
-            print(
-                f"\r  train {batch_index:,}/{len(loader):,} batches "
-                f"| loss {totals['loss'] / sample_count:.4f}",
-                end="",
-                flush=True,
+            progress.set_postfix(
+                loss=f"{totals['loss'] / sample_count:.4f}",
+                refresh=True,
             )
-    print()
     return {name: value / max(sample_count, 1) for name, value in totals.items()}
 
 
@@ -140,13 +146,21 @@ def evaluate(
     confidence_threshold: float,
     nms_threshold: float,
     iou_threshold: float,
+    progress_name: str = "Validate",
 ) -> dict[str, float]:
     model.eval()
     totals = {name: 0.0 for name in LOSS_NAMES}
     metrics = DetectionMetrics(iou_threshold=iou_threshold)
     sample_count = 0
 
-    for batch_index, (images, targets_cpu) in enumerate(loader, start=1):
+    progress = tqdm(
+        loader,
+        desc=progress_name,
+        unit="batch",
+        dynamic_ncols=True,
+        leave=True,
+    )
+    for batch_index, (images, targets_cpu) in enumerate(progress, start=1):
         images = images.to(device, non_blocking=True)
         targets = move_targets(targets_cpu, device)
         outputs = model(images)
@@ -163,12 +177,10 @@ def evaluate(
         for name in LOSS_NAMES:
             totals[name] += float(losses[name].item()) * batch_size
         if batch_index == len(loader) or batch_index % 50 == 0:
-            print(
-                f"\r  eval  {batch_index:,}/{len(loader):,} batches",
-                end="",
-                flush=True,
+            progress.set_postfix(
+                loss=f"{totals['loss'] / sample_count:.4f}",
+                refresh=True,
             )
-    print()
 
     results = {name: value / max(sample_count, 1) for name, value in totals.items()}
     results.update(metrics.compute())
@@ -385,7 +397,7 @@ def main() -> None:
         f"{trainable_parameters:,} trainable | "
         f"{total_parameters / LARGE_MODEL_PARAMETERS:.2%} of large"
     )
-    criterion = HungarianDetectionCriterion()
+    criterion = YOLODetectionCriterion() if args.model_size.startswith("yolo_") else HungarianDetectionCriterion()
     optimizer = AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -431,6 +443,7 @@ def main() -> None:
             args.confidence_threshold,
             args.nms_threshold,
             args.iou_threshold,
+            "Validate",
         )
         scheduler.step(val_metrics["loss"])
 
@@ -505,6 +518,7 @@ def main() -> None:
             args.confidence_threshold,
             args.nms_threshold,
             args.iou_threshold,
+            "Test",
         )
         print_metrics("Test", test_metrics)
         torch.save(test_metrics, args.output_dir / "test_metrics.pt")

@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("outputs/mnist_detector_small/best.pt"),
+        default=Path("outputs/yolo_mnist_detector_small/best.pt"),
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data/uni_with_bboxes"))
     parser.add_argument("--split", choices=("train", "val", "test"), default="test")

@@ -1,11 +1,11 @@
 # Composite MNIST detector
 
-This package provides two residual CNN detectors trained from scratch. Both produce 20
-unordered prediction slots containing object confidence, one of ten digit
-classes, and a normalized `xyxy` bounding box.
+This package defaults to an 8×8 YOLO-style grid detector with three prediction
+slots per cell (192 total). Grid assignment replaces Hungarian matching during
+training. Legacy set-prediction detectors remain available as `small`/`large`.
 
-- `small` (default): about 426,015 parameters, 9.29% of the large model.
-- `large`: about 4,585,519 parameters.
+- `yolo_small` (default): 111,933 parameters.
+- `yolo_large`: larger YOLO grid model.
 
 Every convolution block has a residual shortcut before its activation and
 downsampling step. The shortcut uses parameter-free channel padding/slicing,
@@ -17,6 +17,7 @@ From the repository root:
 
 ```bash
 source .env/bin/activate
+pip install tqdm
 python -m src_model.train
 ```
 
@@ -26,8 +27,8 @@ weight decay `1e-4`, automatic CUDA/MPS/CPU selection, and early stopping after
 
 Default outputs are separated by architecture:
 
-- Small: `outputs/mnist_detector_small/`
-- Large: `outputs/mnist_detector/`
+- YOLO small: `outputs/yolo_mnist_detector_small/`
+- YOLO large: `outputs/yolo_mnist_detector_large/`
 
 Each directory contains:
 
@@ -39,14 +40,14 @@ Each directory contains:
 Train the large model explicitly with:
 
 ```bash
-python -m src_model.train --model-size large
+python -m src_model.train --model-size yolo_large
 ```
 
 Resume training with:
 
 ```bash
 python -m src_model.train \
-  --resume outputs/mnist_detector_small/last.pt \
+  --resume outputs/yolo_mnist_detector_small/last.pt \
   --epochs 50
 ```
 
@@ -57,7 +58,7 @@ architecture metadata are treated as large.
 
 ```bash
 python -m src_model.predict \
-  --checkpoint outputs/mnist_detector_small/best.pt \
+  --checkpoint outputs/yolo_mnist_detector_small/best.pt \
   --split test \
   --random
 ```

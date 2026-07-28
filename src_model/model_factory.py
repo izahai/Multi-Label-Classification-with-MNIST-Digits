@@ -9,10 +9,11 @@ from torch import nn
 
 from .mnist_detector import MNISTDetector
 from .small_mnist_detector import SmallMNISTDetector
+from .yolo_mnist_detector import YOLOLargeMNISTDetector, YOLOSmallMNISTDetector
 
 
-MODEL_NAMES = ("small", "large")
-DEFAULT_MODEL_NAME = "small"
+MODEL_NAMES = ("yolo_small", "yolo_large", "small", "large")
+DEFAULT_MODEL_NAME = "yolo_small"
 LARGE_MODEL_PARAMETERS = 4_585_519
 
 
@@ -29,6 +30,10 @@ def build_detector(
         "num_slots": num_slots,
         "dropout": dropout,
     }
+    if model_name == "yolo_small":
+        return YOLOSmallMNISTDetector(**config)
+    if model_name == "yolo_large":
+        return YOLOLargeMNISTDetector(**config)
     if model_name == "small":
         return SmallMNISTDetector(**config)
     if model_name == "large":
@@ -57,6 +62,10 @@ def build_detector_from_checkpoint(
 
 
 def default_output_dir(model_name: str) -> Path:
+    if model_name == "yolo_small":
+        return Path("outputs/yolo_mnist_detector_small")
+    if model_name == "yolo_large":
+        return Path("outputs/yolo_mnist_detector_large")
     if model_name == "small":
         return Path("outputs/mnist_detector_small")
     if model_name == "large":
