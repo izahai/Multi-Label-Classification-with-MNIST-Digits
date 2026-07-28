@@ -1,0 +1,11 @@
+# Local Python environments and caches
+.env/
+__pycache__/
+*.py[cod]
+
+# Generated datasets
+*.pt
+
+# Notebook and macOS temporary files
+.ipynb_checkpoints/
+.DS_Store
