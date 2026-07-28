@@ -1,4 +1,4 @@
-"""Train a residual CNN for composite-MNIST multi-label classification.
+"""Train a CNN for composite-MNIST multi-label classification.
 
 The two training splits are concatenated. Validation and test splits remain
 separate so results are reported independently for the original and bbox data.
@@ -30,6 +30,7 @@ from .dataset import load_combined_train, load_split
 from .metrics import PresenceMetrics
 from .models import (
     DEFAULT_MODEL_NAME,
+    MODEL_DEFAULT_DROPOUTS,
     MODEL_NAMES,
     build_classifier,
     build_classifier_from_checkpoint,
@@ -335,7 +336,12 @@ def main() -> None:
             )
         args.model_size = saved_name
         saved_config = resume_checkpoint.get("model_config", {})
-        saved_dropout = float(saved_config.get("dropout", 0.2))
+        saved_dropout = float(
+            saved_config.get(
+                "dropout",
+                MODEL_DEFAULT_DROPOUTS.get(saved_name, 0.2),
+            )
+        )
         saved_threshold = float(resume_checkpoint.get("threshold", 0.5))
         if args.dropout is not None and args.dropout != saved_dropout:
             raise ValueError("--dropout conflicts with the resume checkpoint.")
@@ -345,7 +351,11 @@ def main() -> None:
         args.threshold = saved_threshold
     else:
         args.model_size = args.model_size or DEFAULT_MODEL_NAME
-        args.dropout = 0.2 if args.dropout is None else args.dropout
+        args.dropout = (
+            MODEL_DEFAULT_DROPOUTS[args.model_size]
+            if args.dropout is None
+            else args.dropout
+        )
         args.threshold = 0.5 if args.threshold is None else args.threshold
 
     if not 0.0 <= args.dropout < 1.0:

@@ -8,8 +8,9 @@ of the same digit are ignored.
 
 - `small`: residual CNN with 125,902 trainable parameters.
 - `large`: residual CNN with 1,485,774 trainable parameters.
+- `dense_net`: DenseNet-BC-121 with 6,955,146 trainable parameters.
 
-Both models produce 10 raw logits. Training uses `BCEWithLogitsLoss`; inference
+All models produce 10 raw logits. Training uses `BCEWithLogitsLoss`; inference
 applies sigmoid and a configurable threshold (0.5 by default).
 
 ## Data behavior
@@ -40,6 +41,15 @@ Train the large model:
 python -m src_model_cls.train --model-size large
 ```
 
+Train DenseNet-121 (a smaller batch is recommended because its dense feature
+maps use substantially more accelerator memory):
+
+```bash
+python -m src_model_cls.train \
+  --model-size dense_net \
+  --batch-size 32
+```
+
 Useful options:
 
 ```bash
@@ -52,8 +62,8 @@ python -m src_model_cls.train \
   --num-workers 2
 ```
 
-Outputs default to `outputs/mnist_classifier_small/` or
-`outputs/mnist_classifier_large/`:
+Outputs default to `outputs/mnist_classifier_<model-size>/`, for example
+`outputs/mnist_classifier_dense_net/`:
 
 - `best.pt` and `last.pt`
 - `history.csv`
