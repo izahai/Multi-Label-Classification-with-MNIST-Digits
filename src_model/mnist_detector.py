@@ -1,4 +1,4 @@
-"""Small CNN detector for composite 64×64 MNIST images.
+"""Large residual CNN detector for composite 64×64 MNIST images.
 
 The detector produces 20 unordered object slots. Each slot predicts:
 
@@ -17,7 +17,11 @@ from torch import nn
 
 
 class ConvBlock(nn.Sequential):
-    """Two convolutions followed by 2× spatial downsampling."""
+    """Residual two-convolution block followed by 2× spatial downsampling.
+
+    The shortcut uses parameter-free channel padding or slicing, so the
+    original convolution parameter names remain stable for old checkpoints.
+    """
 
     def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__(
@@ -29,6 +33,31 @@ class ConvBlock(nn.Sequential):
             nn.SiLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
         )
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+    def _shortcut(self, images: torch.Tensor) -> torch.Tensor:
+        if self.in_channels == self.out_channels:
+            return images
+        if self.in_channels > self.out_channels:
+            return images[:, : self.out_channels]
+        padding = images.new_zeros(
+            images.shape[0],
+            self.out_channels - self.in_channels,
+            images.shape[2],
+            images.shape[3],
+        )
+        return torch.cat((images, padding), dim=1)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        residual = self._shortcut(images)
+        features = self[0](images)
+        features = self[1](features)
+        features = self[2](features)
+        features = self[3](features)
+        features = self[4](features)
+        features = self[5](features + residual)
+        return self[6](features)
 
 
 class MNISTDetector(nn.Module):

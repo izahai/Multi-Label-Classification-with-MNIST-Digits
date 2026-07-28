@@ -14,6 +14,7 @@ import time
 
 import matplotlib.pyplot as plt
 import torch
+from torch import nn
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -23,7 +24,14 @@ from .criterion import HungarianDetectionCriterion
 from .dataset import CompositeMNISTDetection, detection_collate
 from .detection_utils import postprocess_detections
 from .metrics import DetectionMetrics
-from .mnist_detector import MNISTDetector
+from .model_factory import (
+    DEFAULT_MODEL_NAME,
+    LARGE_MODEL_PARAMETERS,
+    MODEL_NAMES,
+    build_detector,
+    checkpoint_model_name,
+    default_output_dir,
+)
 
 
 LOSS_NAMES = (
@@ -79,7 +87,7 @@ def make_loader(
 
 
 def train_one_epoch(
-    model: MNISTDetector,
+    model: nn.Module,
     loader: DataLoader,
     criterion: HungarianDetectionCriterion,
     optimizer: AdamW,
@@ -125,7 +133,7 @@ def train_one_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model: MNISTDetector,
+    model: nn.Module,
     loader: DataLoader,
     criterion: HungarianDetectionCriterion,
     device: torch.device,
@@ -169,7 +177,7 @@ def evaluate(
 
 def save_checkpoint(
     path: Path,
-    model: MNISTDetector,
+    model: nn.Module,
     optimizer: AdamW,
     scheduler: ReduceLROnPlateau,
     epoch: int,
@@ -181,6 +189,7 @@ def save_checkpoint(
     torch.save(
         {
             "epoch": epoch,
+            "model_name": args.model_size,
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
@@ -250,14 +259,23 @@ def print_metrics(prefix: str, metrics: dict[str, float]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("data/uni_with_bboxes"))
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/mnist_detector"))
+    parser.add_argument(
+        "--model-size",
+        choices=MODEL_NAMES,
+        help="Detector architecture; defaults to small, or is inferred when resuming.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Defaults to an architecture-specific directory.",
+    )
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--num-slots", type=int, default=20)
-    parser.add_argument("--dropout", type=float, default=0.20)
+    parser.add_argument("--num-slots", type=int)
+    parser.add_argument("--dropout", type=float)
     parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--confidence-threshold", type=float, default=0.25)
@@ -277,14 +295,55 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.num_slots < 8:
-        raise ValueError("--num-slots must be at least 8 for this dataset.")
     if min(args.epochs, args.batch_size, args.patience, args.log_interval) < 1:
         raise ValueError("Epochs, batch size, patience, and log interval must be positive.")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = select_device(args.device)
+    resume_checkpoint = None
+    if args.resume:
+        resume_checkpoint = torch.load(
+            args.resume,
+            map_location=device,
+            weights_only=False,
+        )
+        saved_model_name = checkpoint_model_name(resume_checkpoint)
+        if args.model_size is not None and args.model_size != saved_model_name:
+            raise ValueError(
+                f"--model-size {args.model_size!r} conflicts with checkpoint "
+                f"architecture {saved_model_name!r}."
+            )
+        args.model_size = saved_model_name
+        saved_config = resume_checkpoint.get(
+            "model_config",
+            {"num_classes": 10, "num_slots": 20, "dropout": 0.20},
+        )
+        saved_slots = int(saved_config.get("num_slots", 20))
+        saved_dropout = float(saved_config.get("dropout", 0.20))
+        if args.num_slots is not None and args.num_slots != saved_slots:
+            raise ValueError(
+                f"--num-slots {args.num_slots} conflicts with checkpoint value "
+                f"{saved_slots}."
+            )
+        if args.dropout is not None and args.dropout != saved_dropout:
+            raise ValueError(
+                f"--dropout {args.dropout} conflicts with checkpoint value "
+                f"{saved_dropout}."
+            )
+        args.num_slots = saved_slots
+        args.dropout = saved_dropout
+    else:
+        args.model_size = args.model_size or DEFAULT_MODEL_NAME
+        args.num_slots = 20 if args.num_slots is None else args.num_slots
+        args.dropout = 0.20 if args.dropout is None else args.dropout
+
+    if args.num_slots < 8:
+        raise ValueError("--num-slots must be at least 8 for this dataset.")
+    if not 0 <= args.dropout < 1:
+        raise ValueError("--dropout must be in the range [0, 1).")
+
+    args.output_dir = args.output_dir or default_output_dir(args.model_size)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Device: {device}")
 
@@ -311,14 +370,20 @@ def main() -> None:
         device,
     )
 
-    model = MNISTDetector(num_slots=args.num_slots, dropout=args.dropout).to(device)
+    model = build_detector(
+        args.model_size,
+        num_slots=args.num_slots,
+        dropout=args.dropout,
+    ).to(device)
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
     trainable_parameters = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
     )
     print(
-        f"Model parameters: {total_parameters:,} total | "
-        f"{trainable_parameters:,} trainable"
+        f"Model: {args.model_size} | "
+        f"{total_parameters:,} total parameters | "
+        f"{trainable_parameters:,} trainable | "
+        f"{total_parameters / LARGE_MODEL_PARAMETERS:.2%} of large"
     )
     criterion = HungarianDetectionCriterion()
     optimizer = AdamW(
@@ -334,15 +399,14 @@ def main() -> None:
     best_metric = -1.0
     stale_epochs = 0
     history: list[dict[str, float]] = []
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint["model_state"])
-        optimizer.load_state_dict(checkpoint["optimizer_state"])
-        scheduler.load_state_dict(checkpoint["scheduler_state"])
-        start_epoch = int(checkpoint["epoch"]) + 1
-        best_metric = float(checkpoint.get("best_metric", -1.0))
-        stale_epochs = int(checkpoint.get("stale_epochs", 0))
-        history = checkpoint.get("history", [])
+    if resume_checkpoint is not None:
+        model.load_state_dict(resume_checkpoint["model_state"])
+        optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
+        scheduler.load_state_dict(resume_checkpoint["scheduler_state"])
+        start_epoch = int(resume_checkpoint["epoch"]) + 1
+        best_metric = float(resume_checkpoint.get("best_metric", -1.0))
+        stale_epochs = int(resume_checkpoint.get("stale_epochs", 0))
+        history = resume_checkpoint.get("history", [])
         print(f"Resumed from {args.resume} at epoch {start_epoch}.")
 
     for epoch in range(start_epoch, args.epochs + 1):

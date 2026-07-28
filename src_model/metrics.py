@@ -27,7 +27,7 @@ def _integrated_average_precision(
 
 
 class DetectionMetrics:
-    """Accumulate threshold metrics, exact/group matches, and COCO-style mAP."""
+    """Accumulate detection metrics and class-presence exact matches."""
 
     def __init__(self, iou_threshold: float = 0.50, num_classes: int = 10) -> None:
         self.iou_threshold = iou_threshold
@@ -119,9 +119,14 @@ class DetectionMetrics:
                 int(prediction_cpu["labels"][prediction_index] == target_cpu["labels"][target_index])
                 for prediction_index, target_index, _ in localized_matches
             )
-            self.exact_matches += int(
-                correct == target_count and prediction_count == target_count
-            )
+            # Exact match is a pure multi-label classification metric. It uses
+            # a 10-class presence vector and deliberately ignores boxes and
+            # duplicate instances of the same digit.
+            predicted_presence = torch.zeros(self.num_classes, dtype=torch.bool)
+            target_presence = torch.zeros(self.num_classes, dtype=torch.bool)
+            predicted_presence[prediction_cpu["labels"].unique()] = True
+            target_presence[target_cpu["labels"].unique()] = True
+            self.exact_matches += int(torch.equal(predicted_presence, target_presence))
             self.group_match_sum += correct / max(target_count, 1)
             self.correct_per_sample_sum += correct
             self.sample_count += 1

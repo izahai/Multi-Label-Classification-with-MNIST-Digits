@@ -11,7 +11,7 @@ import torch
 
 from .dataset import CompositeMNISTDetection
 from .detection_utils import postprocess_detections
-from .mnist_detector import MNISTDetector
+from .model_factory import build_detector_from_checkpoint
 from .train import select_device
 
 
@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("outputs/mnist_detector/best.pt"),
+        default=Path("outputs/mnist_detector_small/best.pt"),
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data/uni_with_bboxes"))
     parser.add_argument("--split", choices=("train", "val", "test"), default="test")
@@ -74,13 +74,11 @@ def main() -> None:
     args = parse_args()
     device = select_device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model_config = checkpoint.get(
-        "model_config",
-        {"num_classes": 10, "num_slots": 20, "dropout": 0.20},
-    )
-    model = MNISTDetector(**model_config).to(device)
+    model, model_name = build_detector_from_checkpoint(checkpoint)
+    model = model.to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
+    print(f"Model: {model_name}")
 
     dataset = CompositeMNISTDetection(args.data_dir / f"{args.split}.pt")
     index = (
