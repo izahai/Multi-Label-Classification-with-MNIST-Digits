@@ -377,9 +377,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mnist-dir", type=Path, default=Path("data"))
     parser.add_argument("--output-dir", type=Path, default=Path("data/uni_with_bboxes"))
-    parser.add_argument("--train-size", type=int, default=50_000)
-    parser.add_argument("--val-size", type=int, default=10_000)
-    parser.add_argument("--test-size", type=int, default=10_000)
+    parser.add_argument("--train-size", type=int, default=200_000)
+    parser.add_argument("--val-size", type=int, default=1)
+    parser.add_argument("--test-size", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--max-overlap-ratio",
