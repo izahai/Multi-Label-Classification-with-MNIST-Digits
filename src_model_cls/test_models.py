@@ -10,8 +10,11 @@ from unittest.mock import patch
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from .models import (
+    AdaptiveGeMPool2d,
+    ClassAttentionHead,
     MODEL_NAMES,
     build_classifier,
     build_classifier_from_checkpoint,
@@ -27,6 +30,7 @@ class ClassifierModelTests(unittest.TestCase):
             "large": 0.2,
             "dense_net": 0.3,
             "densenet_atn_head": 0.3,
+            "densenet_atn_head_v2": 0.3,
             "denset_net_atn_head": 0.3,
         }
         self.assertEqual(MODEL_NAMES, tuple(expected_dropouts))
@@ -70,6 +74,56 @@ class ClassifierModelTests(unittest.TestCase):
 
         self.assertEqual(logits.shape, (1, 10))
         self.assertIsInstance(model.dropout, nn.Dropout2d)
+
+    def test_adaptive_gem_matches_average_pooling_at_p_one(self) -> None:
+        pool = AdaptiveGeMPool2d(p=1.0)
+        features = torch.rand(2, 4, 7, 9, requires_grad=True)
+
+        pooled = pool(features, (2, 3))
+        expected = F.adaptive_avg_pool2d(features, (2, 3))
+        pooled.sum().backward()
+
+        torch.testing.assert_close(pooled, expected)
+        self.assertEqual(pooled.shape, (2, 4, 2, 3))
+        self.assertIsNotNone(pool.p.grad)
+
+    def test_densenet_attention_v2_fuses_three_gem_scales(self) -> None:
+        model = build_classifier("densenet_atn_head_v2")
+        model.eval()
+        pooled_shapes = []
+        handles = [
+            pool.register_forward_hook(
+                lambda _module, _inputs, output: pooled_shapes.append(output.shape)
+            )
+            for pool in model.scale_pools
+        ]
+        try:
+            logits = model(torch.randn(1, 1, 64, 64))
+        finally:
+            for handle in handles:
+                handle.remove()
+        nn.BCEWithLogitsLoss()(logits, torch.zeros(1, 10)).backward()
+
+        self.assertEqual(logits.shape, (1, 10))
+        self.assertEqual(pooled_shapes, [torch.Size((1, 256, 8, 8))] * 3)
+        self.assertIsInstance(model.dropout, nn.Dropout2d)
+        self.assertIsInstance(model.classifier, ClassAttentionHead)
+        self.assertEqual(model.classifier.classifier.shape, (10, 256))
+
+    def test_densenet_attention_v2_checkpoint_round_trip(self) -> None:
+        original = build_classifier("densenet_atn_head_v2", dropout=0.15)
+        checkpoint = {
+            "model_name": "densenet_atn_head_v2",
+            "model_config": {"num_classes": 10, "dropout": 0.15},
+            "model_state": original.state_dict(),
+        }
+
+        restored, model_name = build_classifier_from_checkpoint(checkpoint)
+        restored.load_state_dict(checkpoint["model_state"])
+
+        self.assertEqual(model_name, "densenet_atn_head_v2")
+        self.assertEqual(restored.dropout_probability, 0.15)
+        self.assertEqual(count_parameters(restored), count_parameters(original))
 
     def test_training_cli_uses_model_name(self) -> None:
         with patch.object(

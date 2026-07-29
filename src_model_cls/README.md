@@ -12,6 +12,9 @@ of the same digit are ignored.
 - `densenet_atn_head`: DenseNet-BC-121 whose ten classes each learn an
   independent spatial-attention pooling map.
   The requested alias `denset_net_atn_head` is also accepted.
+- `densenet_atn_head_v2`: DenseNet-BC-121 that projects dense blocks 2–4
+  to 256 channels, aligns them with learnable GeM pooling, fuses the three
+  scales, and applies the same class-specific spatial-attention head.
 
 All models produce 10 raw logits. Training uses `BCEWithLogitsLoss`; inference
 applies sigmoid and a configurable threshold (0.5 by default).
@@ -58,6 +61,14 @@ Train the attention-head DenseNet:
 ```bash
 python -m src_model_cls.train \
   --model-name densenet_atn_head \
+  --batch-size 32
+```
+
+Train the GeM multi-scale attention-head DenseNet:
+
+```bash
+python -m src_model_cls.train \
+  --model-name densenet_atn_head_v2 \
   --batch-size 32
 ```
 

@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 MODEL_NAMES = (
@@ -13,6 +14,7 @@ MODEL_NAMES = (
     "large",
     "dense_net",
     "densenet_atn_head",
+    "densenet_atn_head_v2",
     # Keep the spelling from the original experiment request usable in the CLI.
     "denset_net_atn_head",
 )
@@ -22,6 +24,7 @@ MODEL_DEFAULT_DROPOUTS = {
     "large": 0.2,
     "dense_net": 0.3,
     "densenet_atn_head": 0.3,
+    "densenet_atn_head_v2": 0.3,
     "denset_net_atn_head": 0.3,
 }
 
@@ -232,6 +235,31 @@ class ClassAttentionHead(nn.Module):
         return (pooled * self.classifier).sum(dim=-1) + self.bias
 
 
+class AdaptiveGeMPool2d(nn.Module):
+    """Adaptive generalized-mean pooling with a learnable exponent."""
+
+    def __init__(self, p: float = 3.0, eps: float = 1e-6) -> None:
+        super().__init__()
+        if p <= 0.0:
+            raise ValueError("p must be positive.")
+        if eps <= 0.0:
+            raise ValueError("eps must be positive.")
+        self.p = nn.Parameter(torch.tensor(float(p)))
+        self.eps = eps
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        output_size: int | tuple[int, int] = 1,
+    ) -> torch.Tensor:
+        p = self.p.clamp_min(self.eps)
+        pooled = F.adaptive_avg_pool2d(
+            features.clamp_min(self.eps).pow(p),
+            output_size,
+        )
+        return pooled.pow(p.reciprocal())
+
+
 class DenseNet121PresenceClassifier(nn.Module):
     """Small-image DenseNet-BC-121 followed by a multi-label logits head."""
 
@@ -340,6 +368,100 @@ class DenseNet121AttentionPresenceClassifier(DenseNet121PresenceClassifier):
         return self.classifier(features)
 
 
+class DenseNet121MultiScaleAttentionPresenceClassifier(
+    DenseNet121PresenceClassifier
+):
+    """DenseNet-BC-121 with GeM multi-scale fusion and class attention."""
+
+    def __init__(
+        self,
+        *,
+        num_classes: int = 10,
+        dropout: float = 0.3,
+        projection_channels: int = 256,
+    ) -> None:
+        super().__init__(num_classes=num_classes, dropout=dropout)
+        if projection_channels < 1:
+            raise ValueError("projection_channels must be positive.")
+
+        self.projection_channels = projection_channels
+        scale_channels = (512, 1024, 1024)
+        self.scale_projections = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(
+                        channels,
+                        projection_channels,
+                        kernel_size=1,
+                        bias=False,
+                    ),
+                    nn.BatchNorm2d(projection_channels),
+                    nn.ReLU(inplace=True),
+                )
+                for channels in scale_channels
+            ]
+        )
+        self.scale_pools = nn.ModuleList(
+            [AdaptiveGeMPool2d() for _ in scale_channels]
+        )
+        self.fusion = nn.Sequential(
+            nn.Conv2d(
+                len(scale_channels) * projection_channels,
+                projection_channels,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(projection_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.dropout = nn.Dropout2d(dropout)
+        self.classifier = ClassAttentionHead(projection_channels, num_classes)
+        self._initialize_fusion_weights()
+
+    def _initialize_fusion_weights(self) -> None:
+        for module in [*self.scale_projections, self.fusion]:
+            for layer in module.modules():
+                if isinstance(layer, nn.Conv2d):
+                    nn.init.kaiming_normal_(
+                        layer.weight,
+                        mode="fan_in",
+                        nonlinearity="relu",
+                    )
+                elif isinstance(layer, nn.BatchNorm2d):
+                    nn.init.ones_(layer.weight)
+                    nn.init.zeros_(layer.bias)
+        nn.init.kaiming_normal_(
+            self.classifier.attention.weight,
+            mode="fan_in",
+            nonlinearity="relu",
+        )
+        nn.init.zeros_(self.classifier.attention.bias)
+
+    def forward_features(self, images: torch.Tensor) -> torch.Tensor:
+        """Fuse projected outputs from dense blocks two, three, and four."""
+        features = images
+        scale_features = []
+        for layer_index, layer in enumerate(self.features):
+            features = layer(features)
+            if layer_index in (3, 5, 9):
+                scale_features.append(features)
+
+        target_size = scale_features[-1].shape[-2:]
+        pooled_features = [
+            pool(project(scale), target_size)
+            for scale, project, pool in zip(
+                scale_features,
+                self.scale_projections,
+                self.scale_pools,
+            )
+        ]
+        return self.fusion(torch.cat(pooled_features, dim=1))
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        features = self.dropout(self.forward_features(images))
+        return self.classifier(features)
+
+
 def build_classifier(
     model_name: str = DEFAULT_MODEL_NAME,
     *,
@@ -371,7 +493,12 @@ def build_classifier(
             num_classes=num_classes,
             dropout=dropout,
         )
-    return DenseNet121AttentionPresenceClassifier(
+    if model_name in {"densenet_atn_head", "denset_net_atn_head"}:
+        return DenseNet121AttentionPresenceClassifier(
+            num_classes=num_classes,
+            dropout=dropout,
+        )
+    return DenseNet121MultiScaleAttentionPresenceClassifier(
         num_classes=num_classes,
         dropout=dropout,
     )
