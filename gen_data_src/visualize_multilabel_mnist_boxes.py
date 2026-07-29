@@ -16,7 +16,7 @@ from matplotlib.widgets import Button
 import torch
 
 
-DEFAULT_DATASET = Path(__file__).resolve().parents[1] / "data" / "with_bboxes"
+DEFAULT_DATASET = Path(__file__).resolve().parents[1] / "data" / "gen_data"
 
 
 class DatasetViewer:

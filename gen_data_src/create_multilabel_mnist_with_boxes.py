@@ -498,7 +498,7 @@ Slots from `num_digits` through slot 7 are padding and use `-1` in the label, po
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mnist-dir", type=Path, default=Path("data"))
-    parser.add_argument("--output-dir", type=Path, default=Path("data/uni_with_bboxes"))
+    parser.add_argument("--output-dir", type=Path, default=Path("data/gen_data"))
     parser.add_argument(
         "--mode",
         choices=("all", "train"),

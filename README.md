@@ -34,7 +34,7 @@ Training combines these two splits:
 
 ```text
 data/train.pt
-data/uni_with_bboxes/train.pt
+data/gen_data/train.pt
 ```
 
 Validation and test use only:
@@ -50,7 +50,7 @@ Place the original composite-MNIST `train.pt`, `val.pt`, and `test.pt` in
 ```bash
 python gen_data_src/create_multilabel_mnist_with_boxes.py \
   --mnist-dir data \
-  --output-dir data/uni_with_bboxes \
+  --output-dir data/gen_data \
   --mode train
 ```
 

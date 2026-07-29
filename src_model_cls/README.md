@@ -24,7 +24,7 @@ applies sigmoid and a configurable threshold (0.5 by default).
 Training concatenates:
 
 - `data/train.pt`
-- `data/uni_with_bboxes/train.pt`
+- `data/gen_data/train.pt`
 
 Validation and test use only `data/val.pt` and `data/test.pt`; bbox data is
 used only for training.
@@ -77,7 +77,7 @@ Useful options:
 ```bash
 python -m src_model_cls.train \
   --original-data-dir data \
-  --bbox-data-dir data/uni_with_bboxes \
+  --bbox-data-dir data/gen_data \
   --model-name small \
   --epochs 50 \
   --batch-size 256 \

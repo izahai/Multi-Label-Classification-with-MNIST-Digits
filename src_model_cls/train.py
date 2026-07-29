@@ -295,7 +295,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bbox-data-dir",
         type=Path,
-        default=Path("data/uni_with_bboxes"),
+        default=Path("data/gen_data"),
     )
     parser.add_argument("--model-name", choices=MODEL_NAMES)
     parser.add_argument("--output-dir", type=Path)
