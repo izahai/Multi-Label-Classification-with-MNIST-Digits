@@ -38,6 +38,38 @@ from .models import (
 )
 
 
+class ExponentialMovingAverage:
+    """Maintain an EMA copy of both model parameters and buffers."""
+
+    def __init__(self, model: nn.Module, decay: float) -> None:
+        if not 0.0 <= decay < 1.0:
+            raise ValueError("EMA decay must be in [0, 1).")
+        self.decay = decay
+        self.shadow = {
+            name: value.detach().clone() for name, value in model.state_dict().items()
+        }
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for name, value in model.state_dict().items():
+            shadow_value = self.shadow[name]
+            if torch.is_floating_point(value):
+                shadow_value.lerp_(value.detach(), 1.0 - self.decay)
+            else:
+                shadow_value.copy_(value.detach())
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {name: value.detach().clone() for name, value in self.shadow.items()}
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        if state.keys() != self.shadow.keys():
+            raise ValueError("EMA state does not match the current model architecture.")
+        self.shadow = {name: value.detach().clone() for name, value in state.items()}
+
+    def copy_to(self, model: nn.Module) -> None:
+        model.load_state_dict(self.shadow)
+
+
 def select_device(requested: str) -> torch.device:
     """Select CUDA, MPS, or CPU, while validating an explicit request."""
     if requested != "auto":
@@ -89,6 +121,7 @@ def train_one_epoch(
     threshold: float,
     gradient_clip: float,
     amp_enabled: bool,
+    ema: ExponentialMovingAverage,
 ) -> dict[str, float]:
     """Train for one epoch and return BCE plus presence metrics."""
     model.train()
@@ -111,6 +144,7 @@ def train_one_epoch(
         clip_grad_norm_(model.parameters(), gradient_clip)
         scaler.step(optimizer)
         scaler.update()
+        ema.update(model)
 
         batch_size = len(images)
         loss_sum += float(loss.detach().item()) * batch_size
@@ -218,6 +252,7 @@ def save_checkpoint(
     path: Path,
     *,
     model: nn.Module,
+    ema: ExponentialMovingAverage,
     optimizer: AdamW,
     scheduler: ReduceLROnPlateau,
     epoch: int,
@@ -228,6 +263,7 @@ def save_checkpoint(
     best_val_loss: float,
     stale_epochs: int,
     history: list[dict[str, float]],
+    top_checkpoints: list[dict[str, Any]],
     args: argparse.Namespace,
 ) -> None:
     torch.save(
@@ -236,13 +272,17 @@ def save_checkpoint(
             "model_name": model_name,
             "model_config": {"num_classes": 10, "dropout": dropout},
             "threshold": threshold,
-            "model_state": model.state_dict(),
+            # Inference checkpoints use EMA weights; raw weights are retained for resume.
+            "model_state": ema.state_dict(),
+            "training_model_state": model.state_dict(),
+            "ema_state": ema.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
             "best_exact_match": best_exact_match,
             "best_val_loss": best_val_loss,
             "stale_epochs": stale_epochs,
             "history": history,
+            "top_checkpoints": top_checkpoints,
             "training_args": serializable_args(args),
         },
         path,
@@ -267,6 +307,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--gradient-clip", type=float, default=1.0)
+    parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument(
+        "--checkpoint-average-count",
+        type=int,
+        choices=(3, 4, 5),
+        default=5,
+        help="Number of best validation checkpoints to average after training.",
+    )
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
@@ -292,6 +340,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"These arguments must be positive: {', '.join(invalid)}")
     if args.num_workers < 0:
         raise ValueError("--num-workers cannot be negative.")
+    if not 0.0 <= args.ema_decay < 1.0:
+        raise ValueError("--ema-decay must be in [0, 1).")
 
 
 def main() -> None:
@@ -406,14 +456,19 @@ def main() -> None:
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
     amp_enabled = device.type == "cuda" and not args.no_amp
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    ema = ExponentialMovingAverage(model, args.ema_decay)
 
     start_epoch = 1
     best_exact_match = -1.0
     best_val_loss = float("inf")
     stale_epochs = 0
     history: list[dict[str, float]] = []
+    top_checkpoints: list[dict[str, Any]] = []
     if resume_checkpoint is not None:
-        model.load_state_dict(resume_checkpoint["model_state"])
+        model.load_state_dict(
+            resume_checkpoint.get("training_model_state", resume_checkpoint["model_state"])
+        )
+        ema.load_state_dict(resume_checkpoint.get("ema_state", resume_checkpoint["model_state"]))
         optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
         scheduler.load_state_dict(resume_checkpoint["scheduler_state"])
         start_epoch = int(resume_checkpoint["epoch"]) + 1
@@ -423,6 +478,11 @@ def main() -> None:
         best_val_loss = float(resume_checkpoint.get("best_val_loss", float("inf")))
         stale_epochs = int(resume_checkpoint.get("stale_epochs", 0))
         history = list(resume_checkpoint.get("history", []))
+        top_checkpoints = [
+            record
+            for record in resume_checkpoint.get("top_checkpoints", [])
+            if (args.output_dir / record["path"]).is_file()
+        ]
         print(f"Resumed from {args.resume} at epoch {start_epoch}.")
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -438,7 +498,13 @@ def main() -> None:
             args.threshold,
             args.gradient_clip,
             amp_enabled,
+            ema,
         )
+        # Validation and model selection use the smoother EMA weights.
+        raw_model_state = {
+            name: value.detach().clone() for name, value in model.state_dict().items()
+        }
+        ema.copy_to(model)
         original_metrics = evaluate(
             model,
             original_val_loader,
@@ -448,6 +514,7 @@ def main() -> None:
             description="Original val",
             amp_enabled=amp_enabled,
         )
+        model.load_state_dict(raw_model_state)
         scheduler.step(original_metrics["loss"])
 
         row: dict[str, float] = {
@@ -479,6 +546,7 @@ def main() -> None:
 
         checkpoint_options = {
             "model": model,
+            "ema": ema,
             "optimizer": optimizer,
             "scheduler": scheduler,
             "epoch": epoch,
@@ -489,9 +557,34 @@ def main() -> None:
             "best_val_loss": best_val_loss,
             "stale_epochs": stale_epochs,
             "history": history,
+            "top_checkpoints": top_checkpoints,
             "args": args,
         }
         save_checkpoint(args.output_dir / "last.pt", **checkpoint_options)
+
+        candidate_path = (
+            args.output_dir / "top_checkpoints" / f"epoch_{epoch:03d}.pt"
+        )
+        candidate_path.parent.mkdir(parents=True, exist_ok=True)
+        save_checkpoint(candidate_path, **checkpoint_options)
+        candidate_record = {
+            "path": str(candidate_path.relative_to(args.output_dir)),
+            "epoch": epoch,
+            "exact_match": original_metrics["exact_match"],
+            "loss": original_metrics["loss"],
+        }
+        top_checkpoints.append(candidate_record)
+        top_checkpoints.sort(key=lambda item: (-item["exact_match"], item["loss"], item["epoch"]))
+        discarded = top_checkpoints[args.checkpoint_average_count :]
+        top_checkpoints = top_checkpoints[: args.checkpoint_average_count]
+        for record in discarded:
+            discarded_path = args.output_dir / record["path"]
+            if discarded_path.is_file():
+                discarded_path.unlink()
+
+        checkpoint_options["top_checkpoints"] = top_checkpoints
+        save_checkpoint(args.output_dir / "last.pt", **checkpoint_options)
+
         if improved:
             save_checkpoint(args.output_dir / "best.pt", **checkpoint_options)
             print(
@@ -505,6 +598,41 @@ def main() -> None:
             print(f"Early stopping after {stale_epochs} stale epochs.")
             break
 
+    final_top_checkpoints = sorted(
+        top_checkpoints,
+        key=lambda item: (-item["exact_match"], item["loss"], item["epoch"]),
+    )
+    average_path: Path | None = None
+    if len(final_top_checkpoints) >= 3:
+        checkpoints = [
+            torch.load(
+                args.output_dir / record["path"],
+                map_location="cpu",
+                weights_only=False,
+            )
+            for record in final_top_checkpoints
+        ]
+        averaged_state = {
+            name: (
+                torch.stack(
+                    [checkpoint["model_state"][name].float() for checkpoint in checkpoints]
+                )
+                .mean(0)
+                .to(value.dtype)
+            )
+            if torch.is_floating_point(value)
+            else value.clone()
+            for name, value in checkpoints[0]["model_state"].items()
+        }
+        averaged_checkpoint = checkpoints[0]
+        averaged_checkpoint["model_state"] = averaged_state
+        averaged_checkpoint["averaged_checkpoints"] = [
+            record["path"] for record in final_top_checkpoints
+        ]
+        average_path = args.output_dir / f"averaged_top_{len(final_top_checkpoints)}.pt"
+        torch.save(averaged_checkpoint, average_path)
+        print(f"Saved averaged checkpoint to {average_path.resolve()}")
+
     if args.skip_test:
         return
 
@@ -517,31 +645,40 @@ def main() -> None:
     if not best_path.is_file():
         best_path = args.output_dir / "last.pt"
         print("No best checkpoint was written in this run; using last.pt for test.")
-    checkpoint = torch.load(best_path, map_location=device, weights_only=False)
-    model, _ = build_classifier_from_checkpoint(checkpoint)
-    model = model.to(device)
-    model.load_state_dict(checkpoint["model_state"])
-
     original_test = load_split(
         args.original_data_dir,
         "test",
         max_samples=args.max_test_samples,
         source="original",
     )
-    test_results = {}
-    for name, dataset in (("original_test", original_test),):
-        loader = make_loader(dataset, shuffle=False, **loader_options)
+    test_loader = make_loader(original_test, shuffle=False, **loader_options)
+
+    def test_checkpoint(label: str, path: Path) -> dict[str, float]:
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+        checkpoint_model, _ = build_classifier_from_checkpoint(checkpoint)
+        checkpoint_model = checkpoint_model.to(device)
+        checkpoint_model.load_state_dict(checkpoint["model_state"])
         result = evaluate(
-            model,
-            loader,
+            checkpoint_model,
+            test_loader,
             criterion,
             device,
             args.threshold,
-            description=name.replace("_", " ").title(),
+            description=label.replace("_", " ").title(),
             amp_enabled=amp_enabled,
         )
-        test_results[name] = result
-        print_metrics(name.replace("_", " ").title(), result)
+        print_metrics(label.replace("_", " ").title(), result)
+        return result
+
+    test_results = {"best": test_checkpoint("best", best_path)}
+    for rank, record in enumerate(final_top_checkpoints, start=1):
+        label = f"top_{rank:02d}_epoch_{record['epoch']:03d}"
+        test_results[label] = test_checkpoint(label, args.output_dir / record["path"])
+
+    if average_path is not None:
+        test_results[f"averaged_top_{len(final_top_checkpoints)}"] = test_checkpoint(
+            f"averaged_top_{len(final_top_checkpoints)}", average_path
+        )
 
     metrics_path = args.output_dir / "test_metrics.json"
     metrics_path.write_text(json.dumps(test_results, indent=2), encoding="utf-8")

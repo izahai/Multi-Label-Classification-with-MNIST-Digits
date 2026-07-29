@@ -9,7 +9,9 @@ of the same digit are ignored.
 - `small`: residual CNN with 125,902 trainable parameters.
 - `large`: residual CNN with 1,485,774 trainable parameters.
 - `dense_net`: DenseNet-BC-121 with 6,955,146 trainable parameters.
-- `ConvNeXt`: ConvNeXt V2 Femto with 4,850,554 trainable parameters.
+- `densenet_atn_head`: DenseNet-BC-121 whose ten classes each learn an
+  independent spatial-attention pooling map.
+  The requested alias `denset_net_atn_head` is also accepted.
 
 All models produce 10 raw logits. Training uses `BCEWithLogitsLoss`; inference
 applies sigmoid and a configurable threshold (0.5 by default).
@@ -51,10 +53,12 @@ python -m src_model_cls.train \
   --batch-size 32
 ```
 
-Train ConvNeXt V2 Femto:
+Train the attention-head DenseNet:
 
 ```bash
-python -m src_model_cls.train --model-name ConvNeXt
+python -m src_model_cls.train \
+  --model-name densenet_atn_head \
+  --batch-size 32
 ```
 
 Useful options:
@@ -72,13 +76,22 @@ python -m src_model_cls.train \
 Outputs default to `outputs/mnist_classifier_<model-name>/`, for example
 `outputs/mnist_classifier_dense_net/`:
 
-- `best.pt` and `last.pt`
+- `best.pt` and `last.pt` (EMA inference weights; `last.pt` also retains raw
+  weights for resuming)
+- `top_checkpoints/` with the best 3–5 validation checkpoints, controlled by
+  `--checkpoint-average-count 3|4|5` (default: 5)
+- `averaged_top_<N>.pt`, the arithmetic average of the retained EMA checkpoints
+  (written once at least three checkpoints exist)
 - `history.csv`
 - `training_curves.png`
 - `test_metrics.json`
 
 The best checkpoint maximizes exact match on the original validation split. A
-tie is resolved by lower validation BCE loss.
+tie is resolved by lower validation BCE loss. Validation, checkpoint selection,
+and final inference use EMA weights (`--ema-decay`, default `0.999`). After
+training, the best checkpoint, each retained top checkpoint, and the averaged
+checkpoint are all evaluated on the original test split and written to
+`test_metrics.json`.
 
 Resume a run:
 
