@@ -1,4 +1,4 @@
-"""Evaluate a trained classifier on separate original and bbox data sources."""
+"""Evaluate a trained classifier on the original data source."""
 
 from __future__ import annotations
 
@@ -18,11 +18,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--original-data-dir", type=Path, default=Path("data"))
-    parser.add_argument(
-        "--bbox-data-dir",
-        type=Path,
-        default=Path("data/uni_with_bboxes"),
-    )
     parser.add_argument("--splits", nargs="+", choices=("train", "val", "test"))
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -61,35 +56,31 @@ def main() -> None:
 
     results: dict[str, dict[str, float]] = {}
     for split in splits:
-        for source, directory in (
-            ("original", args.original_data_dir),
-            ("bbox", args.bbox_data_dir),
-        ):
-            name = f"{source}_{split}"
-            dataset = load_split(
-                directory,
-                split,
-                max_samples=args.max_samples,
-                source=source,
-            )
-            loader = make_loader(
-                dataset,
-                batch_size=args.batch_size,
-                shuffle=False,
-                num_workers=args.num_workers,
-                device=device,
-            )
-            metrics = evaluate(
-                model,
-                loader,
-                criterion,
-                device,
-                threshold,
-                description=name.replace("_", " ").title(),
-                amp_enabled=amp_enabled,
-            )
-            results[name] = metrics
-            print_metrics(name.replace("_", " ").title(), metrics)
+        name = f"original_{split}"
+        dataset = load_split(
+            args.original_data_dir,
+            split,
+            max_samples=args.max_samples,
+            source="original",
+        )
+        loader = make_loader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            device=device,
+        )
+        metrics = evaluate(
+            model,
+            loader,
+            criterion,
+            device,
+            threshold,
+            description=name.replace("_", " ").title(),
+            amp_enabled=amp_enabled,
+        )
+        results[name] = metrics
+        print_metrics(name.replace("_", " ").title(), metrics)
 
     output_path = args.json_output
     if output_path is None:

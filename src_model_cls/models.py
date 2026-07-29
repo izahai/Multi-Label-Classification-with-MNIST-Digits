@@ -6,14 +6,16 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
-MODEL_NAMES = ("small", "large", "dense_net")
+MODEL_NAMES = ("small", "large", "dense_net", "ConvNeXt")
 DEFAULT_MODEL_NAME = "small"
 MODEL_DEFAULT_DROPOUTS = {
     "small": 0.2,
     "large": 0.2,
     "dense_net": 0.3,
+    "ConvNeXt": 0.0,
 }
 
 
@@ -120,6 +122,213 @@ class MNISTPresenceClassifier(nn.Module):
         features = self.features(self.stem(images))
         pooled = self.pool(features).flatten(1)
         return self.classifier(self.dropout(pooled))
+
+
+class ConvNeXtLayerNorm(nn.Module):
+    """Layer normalization for channels-last or channels-first tensors."""
+
+    def __init__(
+        self,
+        normalized_shape: int,
+        *,
+        eps: float = 1e-6,
+        data_format: str = "channels_last",
+    ) -> None:
+        super().__init__()
+        if data_format not in {"channels_last", "channels_first"}:
+            raise ValueError(f"Unsupported data format: {data_format!r}.")
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.eps = eps
+        self.data_format = data_format
+        self.normalized_shape = normalized_shape
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if self.data_format == "channels_last":
+            return F.layer_norm(
+                inputs,
+                (self.normalized_shape,),
+                self.weight,
+                self.bias,
+                self.eps,
+            )
+
+        mean = inputs.mean(dim=1, keepdim=True)
+        variance = (inputs - mean).pow(2).mean(dim=1, keepdim=True)
+        normalized = (inputs - mean) * torch.rsqrt(variance + self.eps)
+        return (
+            self.weight[:, None, None] * normalized
+            + self.bias[:, None, None]
+        )
+
+
+def drop_path(
+    inputs: torch.Tensor,
+    drop_probability: float = 0.0,
+    training: bool = False,
+) -> torch.Tensor:
+    """Drop complete residual paths independently for each sample."""
+    if drop_probability == 0.0 or not training:
+        return inputs
+    keep_probability = 1.0 - drop_probability
+    shape = (inputs.shape[0], *([1] * (inputs.ndim - 1)))
+    random_tensor = keep_probability + torch.rand(
+        shape,
+        dtype=inputs.dtype,
+        device=inputs.device,
+    )
+    random_tensor.floor_()
+    return inputs * random_tensor / keep_probability
+
+
+class DropPath(nn.Module):
+    """Per-sample stochastic depth."""
+
+    def __init__(self, drop_probability: float = 0.0) -> None:
+        super().__init__()
+        if not 0.0 <= drop_probability < 1.0:
+            raise ValueError("drop_probability must be in [0, 1).")
+        self.drop_probability = drop_probability
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return drop_path(inputs, self.drop_probability, self.training)
+
+
+class GlobalResponseNorm(nn.Module):
+    """ConvNeXt V2 global response normalization for NHWC tensors."""
+
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1, 1, 1, dim))
+        self.beta = nn.Parameter(torch.zeros(1, 1, 1, dim))
+        self.eps = eps
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        response = torch.norm(inputs, p=2, dim=(1, 2), keepdim=True)
+        normalized_response = response / (
+            response.mean(dim=-1, keepdim=True) + self.eps
+        )
+        return inputs + self.gamma * (inputs * normalized_response) + self.beta
+
+
+class ConvNeXtV2Block(nn.Module):
+    """Depthwise ConvNeXt V2 block with GRN and stochastic depth."""
+
+    def __init__(self, dim: int, drop_path_probability: float = 0.0) -> None:
+        super().__init__()
+        self.depthwise_conv = nn.Conv2d(
+            dim,
+            dim,
+            kernel_size=7,
+            padding=3,
+            groups=dim,
+        )
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.expand = nn.Linear(dim, 4 * dim)
+        self.activation = nn.GELU()
+        self.grn = GlobalResponseNorm(4 * dim)
+        self.project = nn.Linear(4 * dim, dim)
+        self.drop_path = (
+            DropPath(drop_path_probability)
+            if drop_path_probability > 0.0
+            else nn.Identity()
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        features = self.depthwise_conv(inputs)
+        features = features.permute(0, 2, 3, 1)
+        features = self.norm(features)
+        features = self.expand(features)
+        features = self.activation(features)
+        features = self.grn(features)
+        features = self.project(features)
+        features = features.permute(0, 3, 1, 2)
+        return inputs + self.drop_path(features)
+
+
+class ConvNeXtV2PresenceClassifier(nn.Module):
+    """ConvNeXt V2 Femto adapted to grayscale 64x64 presence prediction."""
+
+    def __init__(
+        self,
+        *,
+        num_classes: int = 10,
+        dropout: float = 0.0,
+        depths: tuple[int, ...] = (2, 2, 6, 2),
+        dims: tuple[int, ...] = (48, 96, 192, 384),
+        drop_path_rate: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if len(depths) != 4 or len(dims) != 4:
+            raise ValueError("ConvNeXt V2 requires four depths and four dims.")
+        if any(depth < 1 for depth in depths):
+            raise ValueError("Every ConvNeXt stage must contain at least one block.")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1).")
+        if not 0.0 <= drop_path_rate < 1.0:
+            raise ValueError("drop_path_rate must be in [0, 1).")
+
+        self.num_classes = num_classes
+        self.dropout_probability = dropout
+        self.downsample_layers = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(1, dims[0], kernel_size=4, stride=4),
+                    ConvNeXtLayerNorm(
+                        dims[0],
+                        eps=1e-6,
+                        data_format="channels_first",
+                    ),
+                )
+            ]
+        )
+        for stage_index in range(3):
+            self.downsample_layers.append(
+                nn.Sequential(
+                    ConvNeXtLayerNorm(
+                        dims[stage_index],
+                        eps=1e-6,
+                        data_format="channels_first",
+                    ),
+                    nn.Conv2d(
+                        dims[stage_index],
+                        dims[stage_index + 1],
+                        kernel_size=2,
+                        stride=2,
+                    ),
+                )
+            )
+
+        drop_rates = torch.linspace(0, drop_path_rate, sum(depths)).tolist()
+        self.stages = nn.ModuleList()
+        block_index = 0
+        for depth, dim in zip(depths, dims):
+            blocks = []
+            for _ in range(depth):
+                blocks.append(ConvNeXtV2Block(dim, drop_rates[block_index]))
+                block_index += 1
+            self.stages.append(nn.Sequential(*blocks))
+
+        self.norm = nn.LayerNorm(dims[-1], eps=1e-6)
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(dims[-1], num_classes)
+        self.apply(self._initialize_weights)
+
+    @staticmethod
+    def _initialize_weights(module: nn.Module) -> None:
+        if isinstance(module, (nn.Conv2d, nn.Linear)):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def forward_features(self, images: torch.Tensor) -> torch.Tensor:
+        features = images
+        for downsample, stage in zip(self.downsample_layers, self.stages):
+            features = stage(downsample(features))
+        return self.norm(features.mean(dim=(-2, -1)))
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.dropout(self.forward_features(images)))
 
 
 class DenseLayer(nn.Module):
@@ -314,7 +523,12 @@ def build_classifier(
             num_classes=num_classes,
             dropout=dropout,
         )
-    return DenseNet121PresenceClassifier(
+    if model_name == "dense_net":
+        return DenseNet121PresenceClassifier(
+            num_classes=num_classes,
+            dropout=dropout,
+        )
+    return ConvNeXtV2PresenceClassifier(
         num_classes=num_classes,
         dropout=dropout,
     )

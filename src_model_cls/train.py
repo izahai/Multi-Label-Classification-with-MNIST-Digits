@@ -1,10 +1,10 @@
 """Train a CNN for composite-MNIST multi-label classification.
 
-The two training splits are concatenated. Validation and test splits remain
-separate so results are reported independently for the original and bbox data.
+The original and bbox training splits are concatenated. Validation and test
+metrics are calculated only on the original data source.
 
 Example:
-    python -m src_model_cls.train --model-size small
+    python -m src_model_cls.train --model-name small
 """
 
 from __future__ import annotations
@@ -160,17 +160,6 @@ def evaluate(
     return {"loss": loss_sum / max(sample_count, 1), **metrics.compute()}
 
 
-def mean_validation(
-    original: dict[str, float],
-    bbox: dict[str, float],
-) -> dict[str, float]:
-    """Average two validation domains with equal domain weight."""
-    return {
-        key: (original[key] + bbox[key]) / 2.0
-        for key in ("loss", "exact_match", "binary_match")
-    }
-
-
 def print_metrics(prefix: str, metrics: dict[str, float]) -> None:
     print(
         f"{prefix}: loss={metrics['loss']:.4f} "
@@ -197,22 +186,15 @@ def plot_history(path: Path, history: list[dict[str, float]]) -> None:
     axes[0].plot(
         epochs,
         [row["original_val_loss"] for row in history],
-        label="original val",
-    )
-    axes[0].plot(
-        epochs,
-        [row["bbox_val_loss"] for row in history],
-        label="bbox val",
+        label="validation",
     )
     axes[0].set(title="BCE loss", xlabel="Epoch", ylabel="Loss")
     axes[0].grid(alpha=0.25)
     axes[0].legend()
 
     for key, label in (
-        ("original_val_exact_match", "Original exact"),
-        ("bbox_val_exact_match", "BBox exact"),
-        ("original_val_binary_match", "Original binary"),
-        ("bbox_val_binary_match", "BBox binary"),
+        ("original_val_exact_match", "Exact match"),
+        ("original_val_binary_match", "Binary match"),
     ):
         axes[1].plot(epochs, [row[key] for row in history], label=label)
     axes[1].set(title="Validation metrics", xlabel="Epoch", ylabel="Score")
@@ -275,7 +257,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("data/uni_with_bboxes"),
     )
-    parser.add_argument("--model-size", choices=MODEL_NAMES)
+    parser.add_argument("--model-name", choices=MODEL_NAMES)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -329,12 +311,12 @@ def main() -> None:
             weights_only=False,
         )
         saved_name = str(resume_checkpoint["model_name"])
-        if args.model_size is not None and args.model_size != saved_name:
+        if args.model_name is not None and args.model_name != saved_name:
             raise ValueError(
-                f"--model-size {args.model_size!r} conflicts with checkpoint "
+                f"--model-name {args.model_name!r} conflicts with checkpoint "
                 f"model {saved_name!r}."
             )
-        args.model_size = saved_name
+        args.model_name = saved_name
         saved_config = resume_checkpoint.get("model_config", {})
         saved_dropout = float(
             saved_config.get(
@@ -350,9 +332,9 @@ def main() -> None:
         args.dropout = saved_dropout
         args.threshold = saved_threshold
     else:
-        args.model_size = args.model_size or DEFAULT_MODEL_NAME
+        args.model_name = args.model_name or DEFAULT_MODEL_NAME
         args.dropout = (
-            MODEL_DEFAULT_DROPOUTS[args.model_size]
+            MODEL_DEFAULT_DROPOUTS[args.model_name]
             if args.dropout is None
             else args.dropout
         )
@@ -364,7 +346,7 @@ def main() -> None:
         raise ValueError("--threshold must be in [0, 1].")
 
     args.output_dir = args.output_dir or Path(
-        f"outputs/mnist_classifier_{args.model_size}"
+        f"outputs/mnist_classifier_{args.model_name}"
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -381,17 +363,11 @@ def main() -> None:
         max_samples=args.max_val_samples,
         source="original",
     )
-    bbox_val = load_split(
-        args.bbox_data_dir,
-        "val",
-        max_samples=args.max_val_samples,
-        source="bbox",
-    )
     print(
         f"Samples: train={len(train_dataset):,} "
         f"(original={len(train_dataset.datasets[0]):,}, "
         f"bbox={len(train_dataset.datasets[1]):,}) | "
-        f"original val={len(original_val):,} | bbox val={len(bbox_val):,}"
+        f"validation={len(original_val):,}"
     )
 
     loader_options = {
@@ -410,15 +386,14 @@ def main() -> None:
         shuffle=False,
         **loader_options,
     )
-    bbox_val_loader = make_loader(bbox_val, shuffle=False, **loader_options)
 
     model = build_classifier(
-        args.model_size,
+        args.model_name,
         dropout=args.dropout,
     ).to(device)
     total_parameters, trainable_parameters = count_parameters(model)
     print(
-        f"Model: {args.model_size} | {total_parameters:,} total parameters | "
+        f"Model: {args.model_name} | {total_parameters:,} total parameters | "
         f"{trainable_parameters:,} trainable"
     )
 
@@ -473,17 +448,7 @@ def main() -> None:
             description="Original val",
             amp_enabled=amp_enabled,
         )
-        bbox_metrics = evaluate(
-            model,
-            bbox_val_loader,
-            criterion,
-            device,
-            args.threshold,
-            description="BBox val",
-            amp_enabled=amp_enabled,
-        )
-        average_metrics = mean_validation(original_metrics, bbox_metrics)
-        scheduler.step(average_metrics["loss"])
+        scheduler.step(original_metrics["loss"])
 
         row: dict[str, float] = {
             "epoch": epoch,
@@ -494,24 +459,20 @@ def main() -> None:
         row.update(
             {f"original_val_{key}": value for key, value in original_metrics.items()}
         )
-        row.update({f"bbox_val_{key}": value for key, value in bbox_metrics.items()})
-        row.update({f"mean_val_{key}": value for key, value in average_metrics.items()})
         history.append(row)
 
         print_metrics("Train", train_metrics)
-        print_metrics("Original validation", original_metrics)
-        print_metrics("BBox validation", bbox_metrics)
-        print_metrics("Mean validation", average_metrics)
+        print_metrics("Validation", original_metrics)
 
-        exact_improved = average_metrics["exact_match"] > best_exact_match + 1e-12
+        exact_improved = original_metrics["exact_match"] > best_exact_match + 1e-12
         exact_tied = (
-            abs(average_metrics["exact_match"] - best_exact_match) <= 1e-12
+            abs(original_metrics["exact_match"] - best_exact_match) <= 1e-12
         )
-        loss_improved = average_metrics["loss"] < best_val_loss - 1e-12
+        loss_improved = original_metrics["loss"] < best_val_loss - 1e-12
         improved = exact_improved or (exact_tied and loss_improved)
         if improved:
-            best_exact_match = average_metrics["exact_match"]
-            best_val_loss = average_metrics["loss"]
+            best_exact_match = original_metrics["exact_match"]
+            best_val_loss = original_metrics["loss"]
             stale_epochs = 0
         else:
             stale_epochs += 1
@@ -521,7 +482,7 @@ def main() -> None:
             "optimizer": optimizer,
             "scheduler": scheduler,
             "epoch": epoch,
-            "model_name": args.model_size,
+            "model_name": args.model_name,
             "dropout": args.dropout,
             "threshold": args.threshold,
             "best_exact_match": best_exact_match,
@@ -534,8 +495,8 @@ def main() -> None:
         if improved:
             save_checkpoint(args.output_dir / "best.pt", **checkpoint_options)
             print(
-                f"Saved new best checkpoint: mean exact={best_exact_match:.4f}, "
-                f"mean loss={best_val_loss:.4f}"
+                f"Saved new best checkpoint: exact={best_exact_match:.4f}, "
+                f"loss={best_val_loss:.4f}"
             )
         write_history(args.output_dir / "history.csv", history)
         plot_history(args.output_dir / "training_curves.png", history)
@@ -567,17 +528,8 @@ def main() -> None:
         max_samples=args.max_test_samples,
         source="original",
     )
-    bbox_test = load_split(
-        args.bbox_data_dir,
-        "test",
-        max_samples=args.max_test_samples,
-        source="bbox",
-    )
     test_results = {}
-    for name, dataset in (
-        ("original_test", original_test),
-        ("bbox_test", bbox_test),
-    ):
+    for name, dataset in (("original_test", original_test),):
         loader = make_loader(dataset, shuffle=False, **loader_options)
         result = evaluate(
             model,
