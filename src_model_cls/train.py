@@ -12,12 +12,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 from pathlib import Path
 import random
 import time
 from typing import Any
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from torch import nn
 from torch.nn.utils import clip_grad_norm_
@@ -36,6 +38,34 @@ from .models import (
     build_classifier_from_checkpoint,
     count_parameters,
 )
+
+
+def seed_everything(seed: int) -> None:
+    """Seed all RNGs and require deterministic PyTorch operations."""
+    # Required by deterministic CUDA matrix multiplications. This is set before
+    # the first CUDA operation in this process.
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.use_deterministic_algorithms(True)
+
+
+def seed_worker(worker_id: int) -> None:
+    """Give every DataLoader worker a deterministic Python/NumPy seed."""
+    del worker_id  # The worker-specific value is already in torch.initial_seed().
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 class ExponentialMovingAverage:
@@ -96,10 +126,8 @@ def make_loader(
     seed: int = 42,
 ) -> DataLoader:
     """Create a classification DataLoader with accelerator-friendly options."""
-    generator = None
-    if shuffle:
-        generator = torch.Generator()
-        generator.manual_seed(seed)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -108,6 +136,7 @@ def make_loader(
         pin_memory=device.type == "cuda",
         persistent_workers=num_workers > 0,
         generator=generator,
+        worker_init_fn=seed_worker if num_workers > 0 else None,
     )
 
 
@@ -347,10 +376,7 @@ def validate_args(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     validate_args(args)
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+    seed_everything(args.seed)
     device = select_device(args.device)
 
     resume_checkpoint = None
@@ -401,6 +427,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Device: {device}")
+    print(f"Reproducibility: seed={args.seed}, deterministic_algorithms=True")
     print("Loading and concatenating the two training sources...")
     train_dataset = load_combined_train(
         args.original_data_dir,
