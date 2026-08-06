@@ -1,136 +1,66 @@
-# Composite MNIST Multi-Label Classification
+# Multi-Label Classification with MNIST Digits
 
-Train convolutional neural networks to predict which MNIST digits (`0`–`9`)
-are present in a 64×64 composite image. Each image can contain repeated and
-overlapping digits; the target is a 10-element multi-hot presence vector, not
-a digit count or a bounding-box prediction.
+This project builds a CNN model that identifies all digits appearing in a
+`64 × 64` composite MNIST image. Each image contains 6–8 digits, and its target
+is a 10-element multi-label vector representing digits 0–9.
 
-## Project layout
+## 1. Setup
 
-```text
-gen_data_src/   Data download, generation, and visualisation scripts
-src_model_cls/  Model definitions, training, evaluation, and tests
-data/           PyTorch dataset splits (not tracked by Git)
-outputs/        Checkpoints, metrics, and training plots (not tracked by Git)
-```
-
-## Setup
-
-Use Python 3.10+ and install a PyTorch build suitable for your CPU, CUDA, or
-Apple Silicon environment. The remaining dependencies are:
+Run the following commands from the project root:
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install torch torchvision matplotlib tqdm
 ```
 
-## Dataset
+## 2. Generate sample data
 
-The classifier expects PyTorch `.pt` dictionaries with:
-
-- `images`: `uint8` tensor of shape `(N, 64, 64)`
-- `labels`: `float32` multi-hot tensor of shape `(N, 10)`
-
-Training combines these two splits:
-
-```text
-data/train.pt
-data/gen_data/train.pt
-```
-
-Validation and test use only:
-
-```text
-data/val.pt
-data/test.pt
-```
-
-Place the original composite-MNIST `train.pt`, `val.pt`, and `test.pt` in
-`data/`. Then create the additional synthetic training split with:
+The following command generates 12 sample images in `data/demo_generated`
+without overwriting the main training data:
 
 ```bash
 python gen_data_src/create_multilabel_mnist_with_boxes.py \
   --mnist-dir data \
-  --output-dir data/gen_data \
-  --mode train
+  --output-dir data/demo_generated \
+  --mode train \
+  --train-size 12 \
+  --seed 42
 ```
 
-The generator downloads the source MNIST dataset to `data/` if needed and
-creates images with 6–8 transformed, potentially overlapping digits. It also
-records boxes and generation metadata, although the classification pipeline
-uses only `images` and `labels`.
+The original MNIST dataset is downloaded automatically if it is not already
+available. Each image is produced by combining 6–8 rotated digits with varying
+intensities and added noise. The result is saved as
+`data/demo_generated/train.pt`.
 
-## Train
-
-Run commands from the repository root.
+## 3. Visualize the generated data
 
 ```bash
-python -m src_model_cls.train --model-name small
+python gen_data_src/visualize_multilabel_mnist_boxes.py \
+  --data-dir data/demo_generated \
+  --split train
 ```
 
-Available models:
+In the visualization window, use `←`/`→` to navigate between images, `R` to
+open a random sample, and `Q` to quit. Each colored rectangle is a bounding
+box, and the number displayed above it is the corresponding digit label.
 
-| Model | Description |
-| --- | --- |
-| `small` | Compact residual CNN. |
-| `large` | Larger residual CNN. |
-| `dense_net` | DenseNet-BC-121. |
-| `densenet_atn_head` | DenseNet-BC-121 with class-specific spatial attention. |
-| `densenet_atn_head_v2` | DenseNet with block 2–4 multi-scale fusion, learnable GeM pooling, and the attention head. |
+## 4. Train and evaluate on Google Colab
 
-Use a smaller batch for DenseNet models:
+Open [`src_model_cls/notebook_pytorch.ipynb`](src_model_cls/notebook_pytorch.ipynb)
+or [launch it directly in Google Colab](https://colab.research.google.com/github/izahai/Multi-Label-Classification-with-MNIST-Digits/blob/main/src_model_cls/notebook_pytorch.ipynb).
+Then select:
 
-```bash
-python -m src_model_cls.train \
-  --model-name densenet_atn_head_v2 \
-  --batch-size 32 \
-  --epochs 50
-```
+**Runtime → Change runtime type → Hardware accelerator: GPU → GPU type: A100**
 
-Useful development run:
+Finally, select **Runtime → Run all**. The notebook will automatically:
 
-```bash
-python -m src_model_cls.train \
-  --model-name small \
-  --epochs 1 \
-  --batch-size 32 \
-  --max-train-samples 3200 \
-  --max-val-samples 1000 \
-  --max-test-samples 1000
-```
+1. clone the source code from GitHub;
+2. download the required datasets from Google Drive;
+3. train the model;
+4. plot the learning curves and evaluate the model on the validation and test
+   sets.
 
-Training uses `BCEWithLogitsLoss`, AdamW, gradient clipping, early stopping,
-and exponential moving average (EMA) weights for validation and inference.
-Outputs are written to `outputs/mnist_classifier_<model-name>/` and include
-`best.pt`, `last.pt`, selected top checkpoints, metrics, history, and plots.
-
-Resume a run with:
-
-```bash
-python -m src_model_cls.train \
-  --resume outputs/mnist_classifier_densenet_atn_head_v2/last.pt \
-  --epochs 50
-```
-
-## Evaluate
-
-```bash
-python -m src_model_cls.evaluate \
-  --checkpoint outputs/mnist_classifier_densenet_atn_head_v2/best.pt
-```
-
-By default this evaluates train, validation, and test splits. Add
-`--splits val test` to skip the training split. The main metrics are
-`exact_match` (the full 10-label prediction must match) and `binary_match`
-(fraction of correct individual labels).
-
-## Tests
-
-```bash
-python -m unittest src_model_cls.test_models
-```
-
-## Colab
-
-`src_model_cls/train_classifier_colab.ipynb` provides a Google Colab workflow.
-Set the repository and Google Drive paths in its configuration cell, then run
-all cells.
+> **Note:** An A100 GPU may require a paid Colab plan and is subject to
+> availability. If A100 is unavailable, the notebook can still run on another
+> GPU, but training will take longer.
