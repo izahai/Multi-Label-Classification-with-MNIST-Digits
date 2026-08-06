@@ -61,6 +61,8 @@ Finally, select **Runtime → Run all**. The notebook will automatically:
 4. plot the learning curves and evaluate the model on the validation and test
    sets.
 
-> **Note:** An A100 GPU may require a paid Colab plan and is subject to
-> availability. If A100 is unavailable, the notebook can still run on another
-> GPU, but training will take longer.
+> **Reproducibility note:** The reported results were produced and verified on
+> an NVIDIA A100 GPU in Google Colab. Please use the same runtime to reproduce
+> them. Running the notebook on a different GPU or hardware environment may
+> lead to significantly different results, even when the same random seed and
+> deterministic settings are used.
